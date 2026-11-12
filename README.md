@@ -62,14 +62,65 @@ Done when: `kill -9` on any worker produces a correct death message and a new wo
 
 ### Step 2: event-driven supervisor (signalfd + epoll)
 
+**What changes, in one sentence.** From the outside the program looks almost like Step 1: it keeps N workers alive and respawns any that die, with the same output lines. Inside, the parent no longer sleeps in `waitpid`. It sleeps in `epoll_wait`, and "a child died" arrives as an ordinary fd event. One new behavior is visible: Ctrl-C (or SIGTERM) triggers a clean shutdown with a summary, instead of everyone dying at once.
+
+**Why bother, if Step 1 works?** In Step 1 the parent spends its whole life blocked in `waitpid`. In V0 the same parent also runs the network intake loop with epoll, and a process can't sleep in `waitpid` and `epoll_wait` at the same time. The fix is to make child deaths something epoll can report. Then a single loop handles both, and adding the listening socket later is just one more `epoll_ctl`.
+
 Spec:
-1. Same workers and the same slot table.
-2. The parent blocks SIGCHLD, creates a signalfd for it, creates an epoll instance, and registers the signalfd.
-3. Main loop: `epoll_wait` with no timeout. When the signalfd is readable:
-   - `read` the `struct signalfd_siginfo` out of it to consume the notification.
-   - Reap **every** child that is ready, not just one (see the "don't queue" note above). Stop when `waitpid` says there is nothing left to reap right now.
-   - Respawn each reaped slot.
-4. Add SIGINT and SIGTERM to the same signalfd. On either one, the parent does a **graceful shutdown**: sends SIGTERM to every worker, reaps all of them, prints a summary (how many respawns per slot), and exits 0.
+1. Same workers and the same slot table. Add a **respawn counter per slot** next to the PID, for the shutdown summary.
+2. **Setup, in this order:**
+   - Block SIGCHLD, SIGINT and SIGTERM with `sigprocmask`. Blocked signals are not lost: they stay *pending* until something reads them. The order matters (section 6, Q1).
+   - Create a signalfd for those three signals. Pending signals can now be `read` from this fd like data from a pipe.
+   - Create an epoll instance and register the signalfd for `EPOLLIN`.
+   - Only then fork the initial N workers.
+3. **Main loop:** `epoll_wait` with no timeout (`-1`). When the signalfd is readable:
+   - `read` one `struct signalfd_siginfo` to consume the notification. Check the return value: it should be exactly `sizeof(struct signalfd_siginfo)`. `ssi_signo` tells you which signal it was.
+   - **SIGCHLD:** reap **every** child that is ready, not just one (see the "don't queue" note above). Loop on `waitpid(-1, &status, WNOHANG)`:
+     - `> 0`: look up the slot, print the death line (same format as Step 1), respawn into the same slot, bump that slot's counter, and loop again.
+     - `0`: every remaining child is still alive. Stop and go back to `epoll_wait`.
+     - `-1`: `ECHILD` means no children at all. Anything else is a real error: print `strerror(errno)`.
+     - Never pass `0` (blocking) here. The parent must never sleep anywhere except `epoll_wait`.
+     - Don't rely on `ssi_pid`. It names one child, not all of the ones that died.
+   - **SIGINT or SIGTERM:** begin graceful shutdown (item 5).
+4. **Worker setup after fork.** The child inherits the parent's signal mask and every open fd. Before it starts its heartbeat loop, each worker must:
+   - **Unblock** SIGTERM (simplest: restore an empty mask). Otherwise the shutdown SIGTERM stays pending forever, the worker never dies, and shutdown hangs.
+   - **Close** the epoll fd and the signalfd. The worker has no use for them (section 6, Q3 asks what could go wrong if it keeps them).
+
+   Put this in your `spawn_worker` function, so the initial spawn and every respawn share it.
+5. **Graceful shutdown**, on SIGINT or SIGTERM:
+   1. Stop respawning. From now on, a dying worker is expected.
+   2. Send SIGTERM to every PID in the slot table.
+   3. Reap all of them. A blocking `waitpid(-1, &status, 0)` is fine here, since shutdown is the only work left. Stop when it returns `-1` with `ECHILD`. Print each death line as usual.
+   4. Print a summary of how many times each slot was respawned during the run.
+   5. Close the epoll fd and signalfd, and exit 0.
+
+Example of what Ctrl-C might look like (exact format is up to you):
+
+```
+^C
+parent: got SIGINT, shutting down
+slot 0 pid=4512 died: killed by signal 15 (SIGTERM)
+slot 1 pid=4498 died: killed by signal 15 (SIGTERM)
+slot 2 pid=4520 died: killed by signal 15 (SIGTERM)
+slot 3 pid=4499 died: killed by signal 15 (SIGTERM)
+summary: slot 0 respawned 2x, slot 1 0x, slot 2 1x, slot 3 0x
+```
+
+Note that Ctrl-C sends SIGINT to the whole foreground process group, so the workers get it too. Since they have unblocked their mask, its default action kills them before the parent's SIGTERM arrives. Their death lines will say SIGINT (2) instead of SIGTERM. That's fine. The `kill -TERM <parent_pid>` path is the one that exercises the parent sending SIGTERM to every worker.
+
+**Shape of the event loop** (structure only, not code):
+
+```
+setup: block signals -> signalfd -> epoll_create1 -> epoll_ctl(ADD, signalfd) -> spawn N
+loop:
+    epoll_wait(..., -1)
+    for each ready fd (only the signalfd, for now):
+        read one signalfd_siginfo
+        SIGCHLD         -> drain with waitpid(WNOHANG) until 0; report + respawn each
+        SIGINT/SIGTERM  -> shutdown(); exit 0
+```
+
+**What carries over from Step 1 unchanged:** the worker body, `spawn_worker` (plus the post-fork cleanup above), the slot lookup, and death reporting (`WIFEXITED`/`WIFSIGNALED` decoding). Only the main loop and the setup are new.
 
 Done when: every test in section 4 passes, and Ctrl-C leaves no workers running (`pgrep -f <your binary>` is empty).
 
