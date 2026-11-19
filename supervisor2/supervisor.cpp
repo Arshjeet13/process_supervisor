@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <unistd.h>
+#include <map>
 #include <sys/wait.h>
 #include <sys/signalfd.h>
 #include <sys/epoll.h>
@@ -77,6 +78,22 @@ int get_signalfd(){
     return sfd;
 }
 
+/**
+ * Reports whether worked died via exiting or killed by a signal
+ */
+void report_death(int wstatus, int slot, pid_t pid){
+    if(WIFEXITED(wstatus)){
+        // slot <k> pid=<pid> died: exited code=<c>
+        std::cout << "slot " << slot << " pid=" << pid << " died: exited code=" << WEXITSTATUS(wstatus) << "\n" << std::flush;
+    }
+    if(WIFSIGNALED(wstatus)){
+        // slot <k> pid=<pid> died: killed by signal <s> (<name>)
+        const char* abbrev = sigabbrev_np(WTERMSIG(wstatus));
+        std::string signal_name = (abbrev != nullptr) ? abbrev : "unknown";
+        std::cout << "slot " << slot << " pid=" << pid << " died: killed by signal " << WTERMSIG(wstatus) << " (" << signal_name << ")" <<"\n" << std::flush;
+    }
+}
+
 int main(int argc, char** argv){
     if(argc != 2){
         std::cerr << "Usage: "<< argv[0] << " <arg1>\n";
@@ -89,7 +106,7 @@ int main(int argc, char** argv){
     // pending so that it can be read from our signal fd
     block_sigchld();
 
-    // sfd is the fd where SIGCHLD signals get rerouted to
+    // sfd is the fd where SIGCHLD signals can be read from
     int sfd = get_signalfd();
 
     // epfd is the epoll's fd
@@ -105,15 +122,38 @@ int main(int argc, char** argv){
     }
 
     std::vector<pid_t> workers(N);
+
     for(int i=0; i<N; ++i){
         spawn_worker(i, workers);
     }
 
-    // while(true){
-    //     struct epoll_event events[1];
-    //     int nfds = epoll_wait(epfd, events, 1, -1);
-    //     if(nfds == -1){
-    //         std::cerr << "epoll_wait : " << strerror(errno) << "\n";
-    //     }
-    // }
+    while(true){
+        struct epoll_event events[1];
+        int nfds = epoll_wait(epfd, events, 1, -1);
+        if(nfds == -1){
+            std::cerr << "epoll_wait : " << strerror(errno) << "\n";
+        }
+        else{
+            struct signalfd_siginfo siginfo;
+            read(sfd, &siginfo, sizeof(signalfd_siginfo));
+
+            while(true){
+                int wstatus;
+                pid_t pid = waitpid((pid_t) -1, &wstatus, WNOHANG);
+                if(pid <= 0) break;
+
+                int slot = -1;
+                for(int i=1; i <= N; ++i){
+                    if(workers[i] == pid){
+                        slot = i;
+                        break;
+                    }
+                }                
+
+                report_death(wstatus, slot, pid);
+
+                spawn_worker(slot, workers);
+            }            
+        }
+    }
 }
