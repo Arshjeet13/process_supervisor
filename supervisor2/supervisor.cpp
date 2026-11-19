@@ -11,7 +11,18 @@
 #include <string.h>
 #include <cerrno>
 #include <signal.h>
+#include <string>
 #include <vector>
+
+const int MAX_WORKERS = 1024;
+
+// Set up in main(). Workers inherit all three through fork(), so spawn_worker
+// uses them to undo that in the child
+sigset_t original_mask; // signal mask from before we blocked anything
+int sfd  = -1;          // signalfd
+int epfd = -1;          // epoll fd
+
+void shutdown(std::vector<pid_t>& workers, int N, int exitcode);
 
 /**
  * Worker goes into an infinite loop of printing its pid
@@ -35,10 +46,17 @@ void spawn_worker(int slot, std::vector<pid_t>& workers){
     pid_t p = fork();
 
     if(p < 0){
-        std::cerr << "Fork failed\n";
-        _exit(1);
+        // We are still the parent here, so clean up the workers that do exist
+        std::cerr << "fork (slot " << slot << ") : " << strerror(errno) << "\n";
+        shutdown(workers, workers.size(), 1);
     }
     if(p == 0){
+        // The child inherited the parent's blocked mask. Without restoring it,
+        // shutdown's SIGTERM would stay pending forever and waitpid would hang
+        sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        // Only the parent reads these
+        close(sfd);
+        close(epfd);
         worker(slot);
         _exit(0);
     }
@@ -48,28 +66,35 @@ void spawn_worker(int slot, std::vector<pid_t>& workers){
 }
 
 /**
- * Gives the signal SIGCHLD a blocking property. Now, it remains pending
- * until it is explicitly read by our program 
+ * Blocks SIGCHLD, SIGTERM and SIGINT. Now, they remain pending
+ * until they are explicitly read by our program (through the signalfd).
+ * Saves the previous mask in original_mask, for workers to restore.
  */
-void block_sigchld(){
-    sigset_t block_set, old_set;
+void block_signals(){
+    sigset_t block_set;
     sigemptyset(&block_set);
     sigaddset(&block_set, SIGCHLD);
+    sigaddset(&block_set, SIGTERM);
+    sigaddset(&block_set, SIGINT );
 
-    if(sigprocmask(SIG_BLOCK, &block_set, &old_set) != 0){
-        std::cerr << "Blocking SIGCHLD failed\n";
+    if(sigprocmask(SIG_BLOCK, &block_set, &original_mask) != 0){
+        std::cerr << "sigprocmask : " << strerror(errno) << "\n";
         exit(1);
     }
 }
 
 /**
- * Since SIGCHLD is blocked, a SIGCHLD signal sent to our process becomes pending.
+ * Watches: SIGCHLD, SIGTERM, SIGINT (does not block them; block_sigchld() does that)
+ * Since the above signals are blocked, one of them when sent to our process becomes pending.
  * This function returns a fd that allows us to read these pending signals
  */
 int get_signalfd(){
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT );
+
     int sfd = signalfd(-1, &mask, 0);
     if(sfd == -1){
         std::cerr << "signalfd : " << strerror(errno) << "\n";
@@ -94,23 +119,55 @@ void report_death(int wstatus, int slot, pid_t pid){
     }
 }
 
+void shutdown(std::vector<pid_t>& workers, int N, int exitcode){
+    for(int i=0; i<N; ++i){
+        pid_t pid = workers[i];
+        // Slot never filled (fork failed during startup). kill(0, ...) would signal
+        // our whole process group, including us, so skip it
+        if(pid <= 0) continue;
+        kill(pid, SIGTERM); // Graceful stop
+        waitpid(pid, NULL, 0); // Clean up process table entry
+    }
+    exit(exitcode);
+}
+
 int main(int argc, char** argv){
     if(argc != 2){
-        std::cerr << "Usage: "<< argv[0] << " <arg1>\n";
+        std::cerr << "Usage: "<< argv[0] << " <num_workers>\n";
         exit(1);
     }
-    int N = std::stoi(argv[1]);
+
+    // stoi throws on non-numbers and out-of-range values, and stops at the first
+    // non-digit ("12abc" -> 12), so check that the whole argument was consumed
+    int N = 0;
+    try{
+        size_t parsed = 0;
+        N = std::stoi(argv[1], &parsed);
+        if(argv[1][parsed] != '\0') throw std::invalid_argument("trailing characters");
+    }
+    catch(const std::exception&){
+        std::cerr << "num_workers must be a whole number, got \"" << argv[1] << "\"\n";
+        exit(1);
+    }
+    if(N < 1 || N > MAX_WORKERS){
+        std::cerr << "num_workers must be between 1 and " << MAX_WORKERS << ", got " << N << "\n";
+        exit(1);
+    }
 
     // We block SIGCHILD before spawning the workers to ensure that SIGCHLD doesn't
     // get delivered directly to its default action (discard). Blocking it keeps it
     // pending so that it can be read from our signal fd
-    block_sigchld();
+    block_signals();
 
-    // sfd is the fd where SIGCHLD signals can be read from
-    int sfd = get_signalfd();
+    // sfd is the fd where SIGCHLD, SIGTERM and SIGINT can be read from
+    sfd = get_signalfd();
 
     // epfd is the epoll's fd
-    int epfd = epoll_create1(0);
+    epfd = epoll_create1(0);
+    if(epfd == -1){
+        std::cerr << "epoll_create1 : " << strerror(errno) << "\n";
+        exit(1);
+    }
 
     struct epoll_event epevent{};
     epevent.events  = EPOLLIN;
@@ -132,23 +189,51 @@ int main(int argc, char** argv){
         int nfds = epoll_wait(epfd, events, 1, -1);
         if(nfds == -1){
             std::cerr << "epoll_wait : " << strerror(errno) << "\n";
+            shutdown(workers, N, 1);
         }
         else{
             struct signalfd_siginfo siginfo;
-            read(sfd, &siginfo, sizeof(signalfd_siginfo));
+            if(read(sfd, &siginfo, sizeof(signalfd_siginfo)) != sizeof(signalfd_siginfo)){
+                std::cerr << "read from signalfd : " << strerror(errno) << "\n";
+                shutdown(workers, N, 1);
+            }
+
+            if(siginfo.ssi_signo == SIGTERM || siginfo.ssi_signo == SIGINT){
+                std::cout << "parent: got signal " << siginfo.ssi_signo << ", shutting down\n" << std::flush;
+                shutdown(workers, N, 0);
+            }
 
             while(true){
                 int wstatus;
                 pid_t pid = waitpid((pid_t) -1, &wstatus, WNOHANG);
-                if(pid <= 0) break;
+                if(pid == 0){
+                    break;
+                }
+                if(pid == -1){
+                    if(errno != ECHILD){
+                        std::cerr << "waitpid : " << strerror(errno) << "\n";
+                        shutdown(workers, N, 1);
+                    }
+                    else{
+                        for(int i=0; i<N; ++i){
+                            spawn_worker(i, workers);
+                        }
+                        continue;
+                    }
+                }
 
                 int slot = -1;
-                for(int i=1; i <= N; ++i){
+                for(int i=0; i < N; ++i){
                     if(workers[i] == pid){
                         slot = i;
                         break;
                     }
                 }                
+
+                if(slot == -1){
+                    std::cerr << "No slot with pid " << pid << " exists in workers\n";
+                    shutdown(workers, N, 1);
+                }
 
                 report_death(wstatus, slot, pid);
 
